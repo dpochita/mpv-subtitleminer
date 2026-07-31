@@ -4,7 +4,6 @@ export interface MediaSettings {
   imageFormat: 'webp' | 'jpeg' | 'avif'
   imageQuality: number
   imageAnimated: boolean
-  useMpvScreenshot: boolean
   audioFormat: 'opus' | 'mp3'
   audioQuality: number
   audioFilters: string

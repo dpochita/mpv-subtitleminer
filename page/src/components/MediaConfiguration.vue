@@ -156,13 +156,6 @@
     <div class="full-width section-subheader-row">
       <span class="section-label">Image Settings</span>
       <div class="advanced-toggle">
-        <span class="toggle-label">MPV Screenshot</span>
-        <label class="switch">
-          <input v-model="localMedia.useMpvScreenshot" type="checkbox" />
-          <span class="slider"></span>
-        </label>
-      </div>
-      <div class="advanced-toggle">
         <span class="toggle-label">Advanced</span>
         <label class="switch">
           <input v-model="localMedia.imageAdvanced" type="checkbox" />
@@ -171,11 +164,7 @@
       </div>
     </div>
 
-    <small v-if="localMedia.useMpvScreenshot" class="field-hint full-width">
-      Uses mpv&apos;s native screenshot (includes subtitles). FFmpeg image settings are ignored.
-    </small>
-
-    <template v-if="!localMedia.useMpvScreenshot && !localMedia.imageAdvanced">
+    <template v-if="!localMedia.imageAdvanced">
       <label class="form-group">
         <span>Image format</span>
         <select v-model="localSelectedFormat">
@@ -224,7 +213,7 @@
         </div>
       </label>
     </template>
-    <template v-if="!localMedia.useMpvScreenshot && localMedia.imageAdvanced">
+    <template v-else>
       <div class="advanced-row-header">
         <label class="form-group extension-box">
           <span>Extension</span>

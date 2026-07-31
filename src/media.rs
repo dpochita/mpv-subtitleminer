@@ -55,7 +55,6 @@ fn temp_path(prefix: &str, ext: &str) -> PathBuf {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct ImageConfig {
-    pub use_mpv_screenshot: bool,
     pub format: String,
     pub quality: i32,
     pub is_animated: bool,
@@ -66,7 +65,6 @@ pub struct ImageConfig {
 impl Default for ImageConfig {
     fn default() -> Self {
         Self {
-            use_mpv_screenshot: false,
             format: "jpeg".to_string(),
             quality: 5,
             is_animated: false,

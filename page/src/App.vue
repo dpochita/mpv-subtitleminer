@@ -73,7 +73,6 @@
       imageFormat: 'jpeg',
       imageQuality: 5,
       imageAnimated: false,
-      useMpvScreenshot: false,
       audioFormat: 'mp3',
       audioQuality: 128,
       audioFilters: '',
@@ -1154,7 +1153,6 @@
     const media = showSettings.value ? localMedia.value : settings.value.media
     return {
       image_config: {
-        use_mpv_screenshot: media.useMpvScreenshot,
         format: media.imageAdvanced ? media.imageAdvancedExtension : media.imageFormat,
         quality: media.imageQuality,
         is_animated: media.imageAnimated,
