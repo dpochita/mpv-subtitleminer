@@ -405,11 +405,15 @@ async fn handle_mpv(
     let mut next_subtitle_id = 1u64;
     let mut line = String::new();
 
-    // Fallback mode state: cache latest timing from observed properties
+    // Fallback mode: cache timing values from observed properties.
+    // We emit on sub-end change (which fires after sub-start), avoiding the
+    // race condition where sub-text arrives before timing updates.
     let mut latest_sub_start: f64 = 0.0;
     let mut latest_sub_end: f64 = 0.0;
+    let mut latest_sub_text: Option<String> = None;
     let mut latest_secondary_sub_start: f64 = 0.0;
     let mut latest_secondary_sub_end: f64 = 0.0;
+    let mut latest_secondary_sub_text: Option<String> = None;
 
     loop {
         line.clear();
@@ -516,18 +520,36 @@ async fn handle_mpv(
             continue;
         }
 
-        // --- Fallback mode: cache timing values, emit on sub-text change ---
-        // Observer 8: sub-start, 9: sub-end
-        // Observer 11: secondary-sub-start, 12: secondary-sub-end
-        if observer_id == Some(8) {
-            if let Some(val) = json.get("data").and_then(|d| d.as_f64()) {
-                latest_sub_start = val;
+        // --- Fallback mode: cache values, emit on sub-end change ---
+        // sub-start fires before sub-end in practice, so when sub-end arrives
+        // the start time is already up-to-date in the cache.
+
+        // Observer 7: sub-text, 10: secondary-sub-text — cache only
+        if observer_id == Some(7) {
+            if let Some(text) = json.get("data").and_then(|d| d.as_str()) {
+                if text.is_empty() {
+                    latest_sub_text = None;
+                } else {
+                    latest_sub_text = Some(text.to_string());
+                }
             }
             continue;
         }
-        if observer_id == Some(9) {
+        if observer_id == Some(10) {
+            if let Some(text) = json.get("data").and_then(|d| d.as_str()) {
+                if text.is_empty() {
+                    latest_secondary_sub_text = None;
+                } else {
+                    latest_secondary_sub_text = Some(text.to_string());
+                }
+            }
+            continue;
+        }
+
+        // Observer 8: sub-start, 11: secondary-sub-start — cache only
+        if observer_id == Some(8) {
             if let Some(val) = json.get("data").and_then(|d| d.as_f64()) {
-                latest_sub_end = val;
+                latest_sub_start = val;
             }
             continue;
         }
@@ -537,28 +559,31 @@ async fn handle_mpv(
             }
             continue;
         }
-        if observer_id == Some(12) {
-            if let Some(val) = json.get("data").and_then(|d| d.as_f64()) {
-                latest_secondary_sub_end = val;
-            }
-            continue;
-        }
 
-        // Observer 7: sub-text, Observer 10: secondary-sub-text
+        // Observer 9: sub-end, 12: secondary-sub-end — emit trigger
         let track = match observer_id {
-            Some(7) => SubtitleTrack::Primary,
-            Some(10) => SubtitleTrack::Secondary,
+            Some(9) => SubtitleTrack::Primary,
+            Some(12) => SubtitleTrack::Secondary,
             _ => continue,
         };
 
-        let Some(text) = json.get("data").and_then(|d| d.as_str()) else {
-            continue;
-        };
-
-        // mpv sends empty sub-text when subtitles disappear — skip those
-        if text.is_empty() {
-            continue;
+        if let Some(val) = json.get("data").and_then(|d| d.as_f64()) {
+            match track {
+                SubtitleTrack::Primary => latest_sub_end = val,
+                SubtitleTrack::Secondary => latest_secondary_sub_end = val,
+            }
         }
+
+        let text = match track {
+            SubtitleTrack::Primary => match &latest_sub_text {
+                Some(t) => t.clone(),
+                None => continue,
+            },
+            SubtitleTrack::Secondary => match &latest_secondary_sub_text {
+                Some(t) => t.clone(),
+                None => continue,
+            },
+        };
 
         let (raw_start, raw_end) = match track {
             SubtitleTrack::Primary => (latest_sub_start, latest_sub_end),
@@ -570,10 +595,8 @@ async fn handle_mpv(
             SubtitleTrack::Secondary => current_secondary_sub_delay,
         };
         let media_path = current_path.clone().unwrap_or_default();
-        let text = text.to_string();
 
         let bucket = (raw_start * 1000.0).round() as i64 / DEDUP_BUCKET_MS;
-        // Fallback mode: no Style/Name info available, use empty strings
         let key = (track, bucket, String::new(), String::new(), text.clone());
         if !state.recent.lock().await.insert(key) {
             continue;
