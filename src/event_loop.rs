@@ -8,6 +8,7 @@ use tokio::sync::{Mutex, RwLock, broadcast};
 use tokio::time::{Duration, timeout};
 use tokio_tungstenite::{accept_async, tungstenite::Message};
 
+use base64::Engine;
 use crate::media::FfmpegRequest;
 use crate::mpv_stream::MpvStream;
 
@@ -185,14 +186,22 @@ struct SharedState {
     /// Held here (not just in `handle_mpv`) so a client `clear` request can reset
     /// it; reset on media change.
     recent: Mutex<RecentSubtitles>,
+    /// Channel to request MPV screenshots (with subtitles) from handle_mpv.
+    screenshot_tx: Mutex<Option<tokio::sync::mpsc::UnboundedSender<ScreenshotRequest>>>,
+}
+
+struct ScreenshotRequest {
+    mid_time: f64,
+    response: tokio::sync::oneshot::Sender<Option<String>>,
 }
 
 impl SharedState {
-    fn new() -> Arc<Self> {
+    fn new(screenshot_tx: tokio::sync::mpsc::UnboundedSender<ScreenshotRequest>) -> Arc<Self> {
         Arc::new(Self {
             subtitles: RwLock::new(HashMap::new()),
             current_media_path: RwLock::new(None),
             recent: Mutex::new(RecentSubtitles::new(512)),
+            screenshot_tx: Mutex::new(Some(screenshot_tx)),
         })
     }
 }
@@ -298,13 +307,14 @@ pub async fn run_server(
             .map_or_else(|_| format!("port {}", port), |a| a.to_string())
     );
 
-    let state = SharedState::new();
+    let (screenshot_tx, screenshot_rx) = tokio::sync::mpsc::unbounded_channel::<ScreenshotRequest>();
+    let state = SharedState::new(screenshot_tx);
     let (subtitle_tx, _) = broadcast::channel::<SubtitleEvent>(64);
 
     let mpv_state = state.clone();
     let mpv_tx = subtitle_tx.clone();
     tokio::spawn(async move {
-        if let Err(e) = handle_mpv(mpv, mpv_state, mpv_tx).await {
+        if let Err(e) = handle_mpv(mpv, mpv_state, mpv_tx, screenshot_rx).await {
             error!("MPV handler error: {}", e);
         }
         info!("MPV connection closed, shutting down.");
@@ -359,10 +369,61 @@ async fn mpv_property_exists(mpv: &mut MpvStream, property: &str) -> bool {
     }
 }
 
+async fn handle_screenshot(mpv: &mut MpvStream, req: ScreenshotRequest) {
+    use std::io::Write;
+
+    let path = std::env::temp_dir().join(format!("mpv_thumb_{}.jpg", uuid::Uuid::new_v4()));
+    let path_str = path.display().to_string();
+
+    let cmd = format!(
+        "{{\"command\":[\"screenshot-to-file\",\"{}\",\"subtitles\"]}}\n",
+        path_str
+    );
+
+    if mpv.write_all(cmd.as_bytes()).await.is_err() {
+        let _ = req.response.send(None);
+        return;
+    }
+
+    // Read mpv's response; discard any intervening property-change events.
+    let mut line = String::new();
+    let mut ok = false;
+    loop {
+        line.clear();
+        match mpv.read_line(&mut line).await {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {
+                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&line) {
+                    if json.get("error").and_then(|e| e.as_str()) == Some("success") {
+                        ok = true;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    if !ok {
+        let _ = req.response.send(None);
+        return;
+    }
+
+    // Read screenshot file
+    let data = match tokio::fs::read(&path).await {
+        Ok(bytes) if !bytes.is_empty() => {
+            Some(base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &bytes))
+        }
+        _ => None,
+    };
+    let _ = tokio::fs::remove_file(&path).await;
+    let _ = req.response.send(data);
+}
+
 async fn handle_mpv(
     mut mpv: MpvStream,
     state: Arc<SharedState>,
     tx: broadcast::Sender<SubtitleEvent>,
+    mut screenshot_rx: tokio::sync::mpsc::UnboundedReceiver<ScreenshotRequest>,
 ) -> std::io::Result<()> {
     // Check whether the mpv instance supports `sub-text/ass-full`.
     // Some embedded libmpv builds (e.g. IINA) only support the plain `sub-text`
@@ -416,9 +477,22 @@ async fn handle_mpv(
     let mut latest_secondary_sub_text: Option<String> = None;
 
     loop {
-        line.clear();
-        if mpv.read_line(&mut line).await? == 0 {
-            return Ok(()); // EOF
+        tokio::select! {
+            read_result = async {
+                line.clear();
+                mpv.read_line(&mut line).await
+            } => {
+                match read_result {
+                    Ok(0) => return Ok(()), // EOF
+                    Err(e) => return Err(e),
+                    Ok(_) => {}
+                }
+            }
+            Some(req) = screenshot_rx.recv() => {
+                handle_screenshot(&mut mpv, req).await;
+                continue;
+            }
+            else => return Ok(()),
         }
 
         let Ok(json) = serde_json::from_str::<serde_json::Value>(&line) else {
@@ -753,6 +827,42 @@ async fn handle_request(text: &str, client_id: u64, state: &Arc<SharedState>) ->
         _ => {
             let (subtitle_id, media_type, ffmpeg_req) = match request {
                 ProtocolRequest::Thumbnail { id, end_id, image_config } => {
+                    let config = image_config.unwrap_or_default();
+                    if config.use_mpv_screenshot {
+                        // Use mpv IPC screenshot (includes subtitles)
+                        let store = state.subtitles.read().await;
+                        let sub = store.get(&id)?.clone();
+                        let mid_time = if let Some(eid) = end_id
+                            && let Some(end_sub) = store.get(&eid) {
+                                (sub.sub_start + end_sub.sub_end) / 2.0
+                            } else {
+                                (sub.sub_start + sub.sub_end) / 2.0
+                            };
+                        drop(store);
+                        let (tx, rx) = tokio::sync::oneshot::channel();
+                        let req = ScreenshotRequest { mid_time, response: tx };
+                        if let Some(screenshot_tx) = state.screenshot_tx.lock().await.as_ref() {
+                            let _ = screenshot_tx.send(req);
+                            let data = rx.await.ok().flatten();
+                            return Some(
+                                serde_json::json!({
+                                    "type": "thumbnail",
+                                    "id": id,
+                                    "data": data,
+                                })
+                                .to_string(),
+                            );
+                        }
+                        return Some(
+                            serde_json::json!({
+                                "type": "thumbnail",
+                                "id": id,
+                                "data": null,
+                            })
+                            .to_string(),
+                        );
+                    }
+                    // Use ffmpeg (original behavior)
                     let store = state.subtitles.read().await;
                     let mut sub = store.get(&id)?.clone();
                     if let Some(eid) = end_id
@@ -763,7 +873,7 @@ async fn handle_request(text: &str, client_id: u64, state: &Arc<SharedState>) ->
                     (
                         id,
                         "thumbnail",
-                        FfmpegRequest::thumbnail(&sub, image_config),
+                        FfmpegRequest::thumbnail(&sub, Some(config)),
                     )
                 }
                 ProtocolRequest::Audio {
