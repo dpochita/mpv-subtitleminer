@@ -331,33 +331,85 @@ pub async fn run_server(
     }
 }
 
+/// Check whether mpv supports a given property by trying to query it.
+/// Returns true if the property exists (even if its value is empty).
+async fn mpv_property_exists(mpv: &mut MpvStream, property: &str) -> bool {
+    let cmd = format!(
+        "{{\"command\":[\"get_property\",\"{}\"],\"request_id\":9999}}\n",
+        property
+    );
+    if mpv.write_all(cmd.as_bytes()).await.is_err() {
+        return false;
+    }
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match mpv.read_line(&mut line).await {
+            Ok(0) => return false,
+            Err(_) => return false,
+            Ok(_) => {
+                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&line) {
+                    if json.get("request_id").and_then(|v| v.as_u64()) == Some(9999) {
+                        let err = json.get("error").and_then(|e| e.as_str()).unwrap_or("");
+                        return err == "success";
+                    }
+                }
+            }
+        }
+    }
+}
+
 async fn handle_mpv(
     mut mpv: MpvStream,
     state: Arc<SharedState>,
     tx: broadcast::Sender<SubtitleEvent>,
 ) -> std::io::Result<()> {
-    mpv.write_all(
-        b"{\"command\":[\"observe_property\",1,\"sub-text/ass-full\"]}\n\
-          {\"command\":[\"observe_property\",2,\"secondary-sub-text/ass-full\"]}\n\
-          {\"command\":[\"observe_property\",3,\"path\"]}\n\
-          {\"command\":[\"observe_property\",4,\"aid\"]}\n\
-          {\"command\":[\"observe_property\",5,\"sub-delay\"]}\n\
-          {\"command\":[\"observe_property\",6,\"secondary-sub-delay\"]}\n",
-    )
-    .await?;
+    // Check whether the mpv instance supports `sub-text/ass-full`.
+    // Some embedded libmpv builds (e.g. IINA) only support the plain `sub-text`
+    // property.
+    let ass_full_supported = mpv_property_exists(&mut mpv, "sub-text/ass-full").await;
+
+    if ass_full_supported {
+        info!("sub-text/ass-full is supported, using ASS full mode");
+        mpv.write_all(
+            b"{\"command\":[\"observe_property\",1,\"sub-text/ass-full\"]}\n\
+              {\"command\":[\"observe_property\",2,\"secondary-sub-text/ass-full\"]}\n\
+              {\"command\":[\"observe_property\",3,\"path\"]}\n\
+              {\"command\":[\"observe_property\",4,\"aid\"]}\n\
+              {\"command\":[\"observe_property\",5,\"sub-delay\"]}\n\
+              {\"command\":[\"observe_property\",6,\"secondary-sub-delay\"]}\n",
+        )
+        .await?;
+    } else {
+        info!("sub-text/ass-full not available, falling back to sub-text + sub-start + sub-end");
+        mpv.write_all(
+            b"{\"command\":[\"observe_property\",7,\"sub-text\"]}\n\
+              {\"command\":[\"observe_property\",8,\"sub-start\"]}\n\
+              {\"command\":[\"observe_property\",9,\"sub-end\"]}\n\
+              {\"command\":[\"observe_property\",10,\"secondary-sub-text\"]}\n\
+              {\"command\":[\"observe_property\",11,\"secondary-sub-start\"]}\n\
+              {\"command\":[\"observe_property\",12,\"secondary-sub-end\"]}\n\
+              {\"command\":[\"observe_property\",3,\"path\"]}\n\
+              {\"command\":[\"observe_property\",4,\"aid\"]}\n\
+              {\"command\":[\"observe_property\",5,\"sub-delay\"]}\n\
+              {\"command\":[\"observe_property\",6,\"secondary-sub-delay\"]}\n",
+        )
+        .await?;
+    }
     info!("Connected to mpv, observing subtitle changes");
 
     let mut current_path: Option<String> = None;
-    // Latest selected audio track id, kept current via the `aid` observe (id 4)
-    // instead of being queried per subtitle. Defaults to track 1 until mpv sends
-    // the initial property-change for the observe.
     let mut current_aid: i64 = 1;
-    // Latest per-track subtitle delay, kept current via the sub-delay observes
-    // (id 5 primary, id 6 secondary) and applied to timing at emit time.
     let mut current_sub_delay: f64 = 0.0;
     let mut current_secondary_sub_delay: f64 = 0.0;
     let mut next_subtitle_id = 1u64;
     let mut line = String::new();
+
+    // Fallback mode state: cache latest timing from observed properties
+    let mut latest_sub_start: f64 = 0.0;
+    let mut latest_sub_end: f64 = 0.0;
+    let mut latest_secondary_sub_start: f64 = 0.0;
+    let mut latest_secondary_sub_end: f64 = 0.0;
 
     loop {
         line.clear();
@@ -409,17 +461,108 @@ async fn handle_mpv(
             continue;
         }
 
-        // Subtitle changed: primary (observer id 1) or secondary (observer id 2).
-        // The payload is the `sub-text/ass-full` value: zero or more `Dialogue:`
-        // lines (joined by newlines) describing every event currently on screen.
+        // --- ASS full mode: observer IDs 1 (primary) and 2 (secondary) ---
+        if ass_full_supported && (observer_id == Some(1) || observer_id == Some(2)) {
+            let track = match observer_id {
+                Some(1) => SubtitleTrack::Primary,
+                Some(2) => SubtitleTrack::Secondary,
+                _ => continue,
+            };
+
+            let Some(ass_full) = json.get("data").and_then(|d| d.as_str()) else {
+                continue;
+            };
+
+            let delay = match track {
+                SubtitleTrack::Primary => current_sub_delay,
+                SubtitleTrack::Secondary => current_secondary_sub_delay,
+            };
+            let media_path = current_path.clone().unwrap_or_default();
+
+            for dialogue in ass_full.lines() {
+                let Some((raw_start, raw_end, style, name, text)) = parse_ass_dialogue(dialogue)
+                else {
+                    continue;
+                };
+                if text.is_empty() {
+                    continue;
+                }
+
+                let bucket = (raw_start * 1000.0).round() as i64 / DEDUP_BUCKET_MS;
+                let key = (track, bucket, style.to_string(), name.to_string(), text.clone());
+                if !state.recent.lock().await.insert(key) {
+                    continue;
+                }
+
+                let subtitle_id = next_subtitle_id;
+                next_subtitle_id += 1;
+
+                let sub = Subtitle {
+                    id: subtitle_id,
+                    text,
+                    sub_start: raw_start + delay,
+                    sub_end: raw_end + delay,
+                    media_path: media_path.clone(),
+                    aid: current_aid,
+                    track,
+                    style: style.to_string(),
+                    name: name.to_string(),
+                };
+                debug!("[{}:{}] Broadcasting", track.as_str(), subtitle_id);
+                info!("[{}:{}] {}", track.as_str(), subtitle_id, sub.text);
+                state.subtitles.write().await.insert(subtitle_id, sub.clone());
+                let _ = tx.send(SubtitleEvent::New(sub));
+            }
+            continue;
+        }
+
+        // --- Fallback mode: cache timing values, emit on sub-text change ---
+        // Observer 8: sub-start, 9: sub-end
+        // Observer 11: secondary-sub-start, 12: secondary-sub-end
+        if observer_id == Some(8) {
+            if let Some(val) = json.get("data").and_then(|d| d.as_f64()) {
+                latest_sub_start = val;
+            }
+            continue;
+        }
+        if observer_id == Some(9) {
+            if let Some(val) = json.get("data").and_then(|d| d.as_f64()) {
+                latest_sub_end = val;
+            }
+            continue;
+        }
+        if observer_id == Some(11) {
+            if let Some(val) = json.get("data").and_then(|d| d.as_f64()) {
+                latest_secondary_sub_start = val;
+            }
+            continue;
+        }
+        if observer_id == Some(12) {
+            if let Some(val) = json.get("data").and_then(|d| d.as_f64()) {
+                latest_secondary_sub_end = val;
+            }
+            continue;
+        }
+
+        // Observer 7: sub-text, Observer 10: secondary-sub-text
         let track = match observer_id {
-            Some(1) => SubtitleTrack::Primary,
-            Some(2) => SubtitleTrack::Secondary,
+            Some(7) => SubtitleTrack::Primary,
+            Some(10) => SubtitleTrack::Secondary,
             _ => continue,
         };
 
-        let Some(ass_full) = json.get("data").and_then(|d| d.as_str()) else {
+        let Some(text) = json.get("data").and_then(|d| d.as_str()) else {
             continue;
+        };
+
+        // mpv sends empty sub-text when subtitles disappear — skip those
+        if text.is_empty() {
+            continue;
+        }
+
+        let (raw_start, raw_end) = match track {
+            SubtitleTrack::Primary => (latest_sub_start, latest_sub_end),
+            SubtitleTrack::Secondary => (latest_secondary_sub_start, latest_secondary_sub_end),
         };
 
         let delay = match track {
@@ -427,46 +570,33 @@ async fn handle_mpv(
             SubtitleTrack::Secondary => current_secondary_sub_delay,
         };
         let media_path = current_path.clone().unwrap_or_default();
+        let text = text.to_string();
 
-        // Each Dialogue line carries its own absolute Start/End, so overlapping
-        // events become independent rows with correct timing.
-        for dialogue in ass_full.lines() {
-            let Some((raw_start, raw_end, style, name, text)) = parse_ass_dialogue(dialogue)
-            else {
-                continue;
-            };
-            if text.is_empty() {
-                continue;
-            }
-
-            // Bucket the raw (pre-delay) start so re-reports collapse but the
-            // same text recurring later stays a distinct row.
-            let bucket = (raw_start * 1000.0).round() as i64 / DEDUP_BUCKET_MS;
-            let key = (track, bucket, style.to_string(), name.to_string(), text.clone());
-            if !state.recent.lock().await.insert(key) {
-                continue;
-            }
-
-            let subtitle_id = next_subtitle_id;
-            next_subtitle_id += 1;
-
-            let sub = Subtitle {
-                id: subtitle_id,
-                text,
-                sub_start: raw_start + delay,
-                sub_end: raw_end + delay,
-                media_path: media_path.clone(),
-                aid: current_aid,
-                track,
-                style: style.to_string(),
-                name: name.to_string(),
-            };
-            debug!("[{}:{}] Broadcasting", track.as_str(), subtitle_id);
-            info!("[{}:{}] {}", track.as_str(), subtitle_id, sub.text);
-            state.subtitles.write().await.insert(subtitle_id, sub.clone());
-            let _ = tx.send(SubtitleEvent::New(sub));
+        let bucket = (raw_start * 1000.0).round() as i64 / DEDUP_BUCKET_MS;
+        // Fallback mode: no Style/Name info available, use empty strings
+        let key = (track, bucket, String::new(), String::new(), text.clone());
+        if !state.recent.lock().await.insert(key) {
+            continue;
         }
-        continue;
+
+        let subtitle_id = next_subtitle_id;
+        next_subtitle_id += 1;
+
+        let sub = Subtitle {
+            id: subtitle_id,
+            text,
+            sub_start: raw_start + delay,
+            sub_end: raw_end + delay,
+            media_path: media_path.clone(),
+            aid: current_aid,
+            track,
+            style: String::new(),
+            name: String::new(),
+        };
+        debug!("[{}:{}] Broadcasting (fallback)", track.as_str(), subtitle_id);
+        info!("[{}:{}] {}", track.as_str(), subtitle_id, sub.text);
+        state.subtitles.write().await.insert(subtitle_id, sub.clone());
+        let _ = tx.send(SubtitleEvent::New(sub));
     }
 }
 
