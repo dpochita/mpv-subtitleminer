@@ -1354,7 +1354,7 @@
   }
 
   const joinCleaned = (msgs: SubtitleMessage[], clean: (s: string) => string) =>
-    msgs.map((m) => clean(m.subtitle)).join(' ')
+    msgs.map((m) => clean(m.subtitle)).join(' ').replace(/\n/g, '<br>')
 
   type CardFlowSelection = {
     primaryMsgs: SubtitleMessage[]
